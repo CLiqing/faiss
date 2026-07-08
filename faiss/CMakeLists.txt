@@ -119,6 +119,7 @@ set(FAISS_SRC
   IndexLSH.cpp
   IndexNNDescent.cpp
   IndexLattice.cpp
+  IndexTMKFlat.cpp
   IndexNSG.cpp
   IndexPQ.cpp
   IndexFastScan.cpp
@@ -250,6 +251,7 @@ set(FAISS_HEADERS
   IndexNeuralNetCodec.h
   IndexLattice.h
   IndexNNDescent.h
+  IndexTMKFlat.h
   IndexNSG.h
   IndexPQ.h
   IndexFastScan.h
