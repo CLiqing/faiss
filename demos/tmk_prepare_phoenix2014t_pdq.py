@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import random
 from dataclasses import dataclass
@@ -146,6 +147,38 @@ def tail_slice(seq: list[str], target_len: int) -> list[str]:
     return list(seq[max(0, len(seq) - target_len) :])
 
 
+def parse_int_list(text: str) -> list[int]:
+    return [int(x.strip()) for x in text.split(",") if x.strip()]
+
+
+def random_slice(seq: list[str], target_len: int, rng: random.Random) -> list[str]:
+    if len(seq) <= target_len:
+        return list(seq)
+    start = rng.randint(0, len(seq) - target_len)
+    return list(seq[start : start + target_len])
+
+
+def random_context(
+    hashed: list[tuple[str, list[str]]],
+    source_id: str,
+    target_len: int,
+    rng: random.Random,
+) -> list[str]:
+    if target_len <= 0:
+        return []
+    candidates = [(sid, seq) for sid, seq in hashed if sid != source_id and seq]
+    if not candidates:
+        return []
+
+    out: list[str] = []
+    while len(out) < target_len:
+        _sid, seq = rng.choice(candidates)
+        remaining = target_len - len(out)
+        take = min(remaining, len(seq))
+        out.extend(random_slice(seq, take, rng))
+    return out[:target_len]
+
+
 def build_artifact(
     source_videos: list[SourceVideo],
     out_dir: Path,
@@ -155,6 +188,10 @@ def build_artifact(
     min_frames: int,
     synthetic_count: int,
     synthetic_segment_frames: int,
+    hard_contain: bool,
+    needle_frames: list[int],
+    context_multipliers: list[int],
+    include_shifted: bool,
     seed: int,
 ) -> None:
     stride = max(1, round(source_fps / fps))
@@ -191,43 +228,73 @@ def build_artifact(
         )
 
     eligible = [(source_id, seq) for source_id, seq in hashed if len(seq) >= min_frames]
+    rng.shuffle(eligible)
     if synthetic_count > 0:
         eligible = eligible[: min(synthetic_count, len(eligible))]
 
     all_indices = list(range(len(hashed)))
     for idx, (source_id, seq) in enumerate(eligible):
-        segment_len = min(synthetic_segment_frames, max(min_frames, len(seq) // 2))
-        needle = middle_slice(seq, segment_len)
+        if hard_contain:
+            valid_needle_lengths = [n for n in needle_frames if min_frames <= n <= len(seq)]
+            if not valid_needle_lengths:
+                continue
+            segment_len = rng.choice(valid_needle_lengths)
+            context_multiplier = rng.choice(context_multipliers)
+            needle = random_slice(seq, segment_len, rng)
+            prefix = random_context(
+                hashed, source_id, segment_len * context_multiplier, rng
+            )
+            suffix = random_context(
+                hashed, source_id, segment_len * context_multiplier, rng
+            )
+        else:
+            segment_len = min(synthetic_segment_frames, max(min_frames, len(seq) // 2))
+            needle = middle_slice(seq, segment_len)
+            other_indices = [i for i in all_indices if hashed[i][0] != source_id]
+            prefix_id = rng.choice(other_indices)
+            suffix_id = rng.choice([i for i in other_indices if i != prefix_id])
+            prefix = tail_slice(
+                hashed[prefix_id][1], max(min_frames // 2, segment_len // 3)
+            )
+            suffix = head_slice(
+                hashed[suffix_id][1], max(min_frames // 2, segment_len // 3)
+            )
         if len(needle) < min_frames:
             continue
 
-        other_indices = [i for i in all_indices if hashed[i][0] != source_id]
-        prefix_id = rng.choice(other_indices)
-        suffix_id = rng.choice([i for i in other_indices if i != prefix_id])
-        prefix = tail_slice(hashed[prefix_id][1], max(min_frames // 2, segment_len // 3))
-        suffix = head_slice(hashed[suffix_id][1], max(min_frames // 2, segment_len // 3))
         haystack = prefix + needle + suffix
 
-        needle_id = f"{source_id}::needle"
-        haystack_id = f"{source_id}::haystack"
+        needle_id = f"{source_id}::needle_{idx:05d}"
+        haystack_id = f"{source_id}::haystack_{idx:05d}"
         shifted_id = f"{source_id}::shifted_full"
         add_video(video_rows, frame_rows, needle_id, needle, source_id, "needle")
         add_video(video_rows, frame_rows, haystack_id, haystack, source_id, "haystack")
-        add_video(video_rows, frame_rows, shifted_id, prefix + seq, source_id, "shifted_full")
+        if include_shifted:
+            add_video(
+                video_rows,
+                frame_rows,
+                shifted_id,
+                prefix + seq,
+                source_id,
+                "shifted_full",
+            )
         gt_rows.append(
             {
                 "video_id_a": needle_id,
                 "video_id_b": haystack_id,
-                "class": "synthetic_contain",
+                "class": "synthetic_hard_contain"
+                if hard_contain
+                else "synthetic_contain",
             }
         )
-        gt_rows.append(
-            {
-                "video_id_a": f"{source_id}::full",
-                "video_id_b": shifted_id,
-                "class": "synthetic_shifted",
-            }
-        )
+        if include_shifted:
+            gt_rows.append(
+                {
+                    "video_id_a": f"{source_id}::full",
+                    "video_id_b": shifted_id,
+                    "class": "synthetic_shifted",
+                }
+            )
         if (idx + 1) % 100 == 0 or idx + 1 == len(eligible):
             print(
                 f"built synthetic positives {idx + 1}/{len(eligible)}",
@@ -250,6 +317,29 @@ def build_artifact(
         writer.writeheader()
         writer.writerows(gt_rows)
 
+    metadata = {
+        "fps": fps,
+        "source_fps": source_fps,
+        "stride": stride,
+        "max_frames_per_source": max_frames_per_source,
+        "min_frames": min_frames,
+        "synthetic_count": synthetic_count,
+        "synthetic_segment_frames": synthetic_segment_frames,
+        "hard_contain": hard_contain,
+        "needle_frames": needle_frames,
+        "context_multipliers": context_multipliers,
+        "include_shifted": include_shifted,
+        "seed": seed,
+        "source_videos_discovered": len(source_videos),
+        "source_videos_kept": len(hashed),
+        "videos": len(videos),
+        "frames": len(frames),
+        "gt_pairs": len(gt_rows),
+    }
+    (out_dir / "metadata.json").write_text(
+        json.dumps(metadata, indent=2), encoding="utf-8"
+    )
+
     print(f"videos={len(videos)}")
     print(f"frames={len(frames)}")
     print(f"gt_pairs={len(gt_rows)}")
@@ -268,6 +358,10 @@ def main() -> None:
     parser.add_argument("--min-frames", type=int, default=32)
     parser.add_argument("--synthetic-count", type=int, default=500)
     parser.add_argument("--synthetic-segment-frames", type=int, default=96)
+    parser.add_argument("--hard-contain", action="store_true")
+    parser.add_argument("--needle-frames", default="16,32,64")
+    parser.add_argument("--context-multipliers", default="5,10,20")
+    parser.add_argument("--include-shifted", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int, default=1234)
     args = parser.parse_args()
 
@@ -282,6 +376,10 @@ def main() -> None:
         min_frames=args.min_frames,
         synthetic_count=args.synthetic_count,
         synthetic_segment_frames=args.synthetic_segment_frames,
+        hard_contain=args.hard_contain,
+        needle_frames=parse_int_list(args.needle_frames),
+        context_multipliers=parse_int_list(args.context_multipliers),
+        include_shifted=args.include_shifted,
         seed=args.seed,
     )
 
